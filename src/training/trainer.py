@@ -23,7 +23,7 @@ from lightning.fabric.utilities.rank_zero import rank_zero_only
 from datasets import Dataset, load_dataset
 from typing import Dict, Any, List, Tuple, Optional
 
-from src.model import Pico
+from src.model import MAMLCompatiblePico
 
 from src.training.utils import (
     initialize_run_dir,
@@ -110,7 +110,9 @@ class Trainer:
         self.tokenizer = initialize_tokenizer(data_config=self.configs["data"])
 
         # Setup Model, Optimizer, and Dataloaders
-        self.model = Pico(model_config=self.configs["model"], fabric=self.fabric)
+        self.model = MAMLCompatiblePico(
+            model_config=self.configs["model"], fabric=self.fabric
+        )
         self.optimizer = initialize_optimizer(
             training_config=self.configs["training"], model=self.model
         )

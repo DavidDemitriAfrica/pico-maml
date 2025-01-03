@@ -7,4 +7,4 @@ recommend you add modules to this package.
 
 # ruff: noqa: F401
 
-from .pico import Pico
+from .pico import MAMLCompatiblePico
