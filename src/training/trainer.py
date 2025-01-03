@@ -21,7 +21,7 @@ import os
 from lightning.fabric.utilities.rank_zero import rank_zero_only
 
 from datasets import Dataset, load_dataset
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple, Optional
 
 from src.model import Pico
 
@@ -47,6 +47,8 @@ from src.checkpointing import (
 )
 
 from src.evaluation import run_evaluation
+
+from copy import deepcopy
 
 
 class Trainer:
@@ -651,3 +653,240 @@ class Trainer:
     def log(self, msg: str, level: int = logging.INFO) -> None:
         """Log messages only from rank zero process."""
         self.logger.log(level, msg)
+
+
+class MAMLTrainer:
+    def __init__(self, config_path: str):
+        """
+        Initializes the MAML Trainer with meta-learning specific configurations.
+        Inherits basic setup from original Trainer but adds MAML-specific components.
+        """
+        # Keep original initialization but add MAML-specific configs
+        super().__init__(config_path)
+
+        # MAML specific configurations
+        self.inner_lr = self.configs["training"].get("inner_learning_rate", 0.01)
+        self.num_inner_steps = self.configs["training"].get("num_inner_steps", 5)
+        self.meta_batch_size = self.configs["training"].get("meta_batch_size", 4)
+        self.num_tasks = self.configs["training"].get("num_tasks", 100)
+
+        # Verify the model supports computational graph requirements
+        self._verify_model_compatibility()
+
+    def _verify_model_compatibility(self):
+        """
+        Verifies that the model setup is compatible with MAML requirements.
+        """
+        # Check if model parameters are leaf nodes (required for proper grad tracking)
+        for name, param in self.model.named_parameters():
+            if not param.is_leaf:
+                raise ValueError(
+                    f"Parameter {name} is not a leaf node. MAML requires leaf parameters."
+                )
+
+    def _clone_model(self, model: torch.nn.Module) -> torch.nn.Module:
+        """
+        Creates a clone of the model with copied parameters for inner loop optimization.
+        """
+        clone = deepcopy(model)
+
+        # Ensure parameters are properly connected for gradient tracking
+        for param in clone.parameters():
+            param.requires_grad = True
+
+        return clone
+
+    def _compute_loss(
+        self, model: torch.nn.Module, batch: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Computes the loss for a given batch using the provided model.
+        """
+        input_ids = batch["input_ids"][:, :-1]
+        labels = batch["input_ids"][:, 1:]
+
+        output, _ = model(input_ids)
+        output = output.transpose(1, 2)
+        return F.cross_entropy(output, labels)
+
+    def _inner_loop_update(
+        self, model: torch.nn.Module, support_batch: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.nn.Module, List[float]]:
+        """
+        Performs inner loop optimization for a single task.
+        """
+        adapted_model = self._clone_model(model)
+        losses = []
+
+        for _ in range(self.num_inner_steps):
+            loss = self._compute_loss(adapted_model, support_batch)
+            losses.append(loss.item())
+
+            # Manual parameter update to maintain computational graph
+            grads = torch.autograd.grad(
+                loss, adapted_model.parameters(), create_graph=True
+            )
+            for param, grad in zip(adapted_model.parameters(), grads):
+                param.data = param.data - self.inner_lr * grad
+
+        return adapted_model, losses
+
+    def _meta_batch_step(
+        self, tasks: List[Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]]
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Performs a complete meta-batch update step.
+        """
+        meta_loss = 0.0
+        meta_metrics = {
+            "inner_loss_before": 0.0,
+            "inner_loss_after": 0.0,
+            "outer_loss": 0.0,
+        }
+
+        for support_batch, query_batch in tasks:
+            # Inner loop adaptation
+            initial_loss = self._compute_loss(self.model, support_batch)
+            meta_metrics["inner_loss_before"] += initial_loss.item()
+
+            adapted_model, inner_losses = self._inner_loop_update(
+                self.model, support_batch
+            )
+            meta_metrics["inner_loss_after"] += inner_losses[-1]
+
+            # Compute loss on query set using adapted model
+            query_loss = self._compute_loss(adapted_model, query_batch)
+            meta_loss += query_loss
+            meta_metrics["outer_loss"] += query_loss.item()
+
+        # Average metrics
+        for k in meta_metrics:
+            meta_metrics[k] /= len(tasks)
+
+        return meta_loss / len(tasks), meta_metrics
+
+    def _training_loop(self) -> int:
+        """
+        Main MAML training loop.
+        """
+        batch_step = self.initial_batch_step
+
+        while batch_step < self.configs["training"].max_steps:
+            # Sample tasks for meta-batch
+            tasks = [self._sample_task() for _ in range(self.meta_batch_size)]
+
+            # Meta-optimization step
+            meta_loss, meta_metrics = self._meta_batch_step(tasks)
+
+            # Outer loop optimization
+            self.optimizer.zero_grad()
+            self.fabric.backward(meta_loss)
+
+            # Gradient clipping if configured
+            if self.configs["training"].optimization.get("max_grad_norm"):
+                self.fabric.clip_gradients(
+                    self.model,
+                    self.optimizer,
+                    max_norm=self.configs["training"].optimization.max_grad_norm,
+                )
+
+            self.optimizer.step()
+            self.lr_scheduler.step()
+
+            # Logging
+            if batch_step % self.configs["monitoring"].logging.log_every_n_steps == 0:
+                self._log_maml_metrics(meta_metrics, batch_step)
+
+            # Checkpointing and evaluation
+            if batch_step % self.configs["checkpointing"].save_every_n_steps == 0:
+                self._save_and_evaluate(batch_step)
+
+            batch_step += 1
+
+        return batch_step
+
+    def _sample_task(self) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """
+        Samples a task consisting of support and query sets.
+        This is a placeholder - implement actual task sampling logic based on your needs.
+        """
+        # Example implementation - replace with actual task sampling logic
+        support_batch = next(iter(self.train_dataloader))
+        query_batch = next(iter(self.train_dataloader))
+        return support_batch, query_batch
+
+    def _log_maml_metrics(self, metrics: Dict[str, float], batch_step: int):
+        """
+        Logs MAML-specific metrics.
+        """
+        self.log(f"Step {batch_step} -- 🔄 MAML Metrics")
+        self.log(f"├── Inner Loss (Before): {metrics['inner_loss_before']:.4f}")
+        self.log(f"├── Inner Loss (After): {metrics['inner_loss_after']:.4f}")
+        self.log(f"└── Outer Loss: {metrics['outer_loss']:.4f}")
+
+        # Log to experiment tracker
+        for name, value in metrics.items():
+            self.fabric.log(f"maml/{name}", value, step=batch_step)
+
+    def _save_and_evaluate(self, batch_step: int):
+        """
+        Handles checkpointing and evaluation for MAML.
+        """
+        self.log(f"Step {batch_step} -- 💾 Saving MAML Checkpoint")
+        save_checkpoint(
+            configs=self.configs,
+            checkpoint_step=batch_step,
+            fabric=self.fabric,
+            model=self.model,
+            optimizer=self.optimizer,
+            lr_scheduler=self.lr_scheduler,
+            tokenizer=self.tokenizer,
+        )
+
+        if self.should_evaluate:
+            # Perform meta-validation
+            evaluation_results = self._meta_validation()
+            if evaluation_results is not None:
+                self._log_evaluation_results(evaluation_results, batch_step)
+                save_evaluation_results(
+                    checkpointing_config=self.configs["checkpointing"],
+                    fabric=self.fabric,
+                    evaluation_results=evaluation_results,
+                    checkpoint_step=batch_step,
+                )
+
+    def _meta_validation(self) -> Optional[Dict[str, float]]:
+        """
+        Performs meta-validation on new tasks.
+        """
+        self.model.eval()
+        validation_metrics = {"meta_val_loss": 0.0, "adaptation_improvement": 0.0}
+
+        num_val_tasks = 50  # Configure as needed
+
+        with torch.no_grad():
+            for _ in range(num_val_tasks):
+                support_batch, query_batch = (
+                    self._sample_task()
+                )  # Sample validation task
+
+                # Measure pre-adaptation performance
+                initial_loss = self._compute_loss(self.model, query_batch)
+
+                # Adapt to support set
+                adapted_model, _ = self._inner_loop_update(self.model, support_batch)
+
+                # Measure post-adaptation performance
+                adapted_loss = self._compute_loss(adapted_model, query_batch)
+
+                validation_metrics["meta_val_loss"] += adapted_loss.item()
+                validation_metrics["adaptation_improvement"] += (
+                    initial_loss.item() - adapted_loss.item()
+                )
+
+        # Average metrics
+        for k in validation_metrics:
+            validation_metrics[k] /= num_val_tasks
+
+        self.model.train()
+        return validation_metrics

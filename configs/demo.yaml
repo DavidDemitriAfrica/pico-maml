@@ -28,8 +28,10 @@ monitoring:
     log_every_n_steps: 10
 
 training:
-  learning_rate: 0.001
-  max_steps: 100
+  inner_learning_rate: 0.01
+  num_inner_steps: 5
+  meta_batch_size: 4
+  num_tasks: 100
 
   optimization:
     lr: 0.001
