@@ -11,7 +11,6 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from huggingface_hub import upload_folder
 
-from src.model import Pico
 
 # typing imports
 import torch.nn as nn
@@ -20,6 +19,7 @@ from datasets import Dataset
 from transformers import PreTrainedTokenizerBase
 from src.config import CheckpointingConfig
 from src.config.checkpointing_config import LearningDynamicsCheckpointingConfig
+from src.model import MAMLCompatiblePico
 from lightning.fabric import Fabric
 
 
@@ -241,7 +241,7 @@ def compute_learning_dynamics_states(
     extractor_dataloader = fabric.setup_dataloaders(dataloader)
 
     # Create a new model instance with same parameters but zero gradients
-    _model = Pico(model.config, fabric=fabric).to(fabric.device)
+    _model = MAMLCompatiblePico(model.config, fabric=fabric).to(fabric.device)
     _model.load_state_dict(model.state_dict())
     _model.zero_grad()
 

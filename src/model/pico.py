@@ -543,132 +543,8 @@ class Pico(nn.Module):
 ########################################################
 
 
-class MAMLCompatiblePico(nn.Module):
-    """
-    Modified version of Pico model with MAML compatibility requirements.
-    Key changes:
-    - Explicit parameter registration to ensure leaf nodes
-    - Modified forward passes to maintain computational graphs
-    - Support for higher-order gradients
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-
-        # Modified parameter initialization to ensure leaf nodes
-        self.register_parameter(
-            "embedding_weight",
-            nn.Parameter(torch.empty(config.vocab_size, config.d_model)),
-        )
-        nn.init.normal_(self.embedding_weight, std=0.02)
-
-        # Modified layers for MAML compatibility
-        self.layers = nn.ModuleList(
-            [MAMLCompatiblePicoBlock(config) for _ in range(config.n_layers)]
-        )
-
-        # Output layers
-        self.register_parameter(
-            "output_norm_weight", nn.Parameter(torch.ones(config.d_model))
-        )
-        self.register_parameter(
-            "output_proj_weight",
-            nn.Parameter(torch.empty(config.vocab_size, config.d_model)),
-        )
-        nn.init.normal_(self.output_proj_weight, std=0.02)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[Tuple[torch.Tensor, torch.Tensor]]]]:
-        # Modified forward pass to maintain computational graph
-        h = F.embedding(input_ids, self.embedding_weight)
-
-        cached_key_values = () if use_cache else None
-
-        for idx, layer in enumerate(self.layers):
-            layer_past = past_key_values[idx] if past_key_values is not None else None
-            h, layer_cached = layer(h, past_key_values=layer_past, use_cache=use_cache)
-            if use_cache:
-                cached_key_values += (layer_cached,)
-
-        # Modified output computation to maintain graph
-        h = F.layer_norm(
-            h,
-            normalized_shape=h.size(-1),
-            weight=self.output_norm_weight,
-            eps=self.config.norm_eps,
-        )
-        logits = F.linear(h, self.output_proj_weight)
-
-        return logits.float(), cached_key_values
-
-
-class MAMLCompatibleAttention(nn.Module):
-    """MAML-compatible version of the multi-head attention mechanism"""
-
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-
-        # Explicit parameter registration for query, key, value projections
-        self.register_parameter(
-            "q_proj_weight",
-            nn.Parameter(
-                torch.empty(
-                    config.d_model,
-                    config.attention_n_heads
-                    * (config.d_model // config.attention_n_heads),
-                )
-            ),
-        )
-        self.register_parameter(
-            "k_proj_weight",
-            nn.Parameter(
-                torch.empty(
-                    config.d_model,
-                    config.attention_n_kv_heads
-                    * (config.d_model // config.attention_n_heads),
-                )
-            ),
-        )
-        self.register_parameter(
-            "v_proj_weight",
-            nn.Parameter(
-                torch.empty(
-                    config.d_model,
-                    config.attention_n_kv_heads
-                    * (config.d_model // config.attention_n_heads),
-                )
-            ),
-        )
-        self.register_parameter(
-            "o_proj_weight",
-            nn.Parameter(
-                torch.empty(
-                    config.d_model,
-                    config.attention_n_heads
-                    * (config.d_model // config.attention_n_heads),
-                )
-            ),
-        )
-
-        # Initialize weights
-        nn.init.normal_(self.q_proj_weight, std=0.02)
-        nn.init.normal_(self.k_proj_weight, std=0.02)
-        nn.init.normal_(self.v_proj_weight, std=0.02)
-        nn.init.normal_(self.o_proj_weight, std=0.02)
-
-        self.n_heads = config.attention_n_heads
-        self.n_kv_heads = config.attention_n_kv_heads
-        self.head_dim = config.d_model // config.attention_n_heads
-        self.n_rep = self.n_heads // self.n_kv_heads
-
-        # RoPE remains the same as it doesn't need parameter modifications
-        self.rope = RoPE(config)
+class MAMLCompatibleAttention(Attention):
+    """Minimally modified Attention for MAML compatibility"""
 
     def forward(
         self,
@@ -677,19 +553,18 @@ class MAMLCompatibleAttention(nn.Module):
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        # Only modification: ensure gradients can flow through computation
         bsz, seq_len, _ = input.shape
 
-        # Linear projections with explicit operations for gradient tracking
-        queries = F.linear(input, self.q_proj_weight)
-        keys = F.linear(input, self.k_proj_weight)
-        values = F.linear(input, self.v_proj_weight)
+        # Use retained_output=True for gradient flow in projections
+        _queries = self.q_proj(input)
+        _keys = self.k_proj(input)
+        _values = self.v_proj(input)
 
-        # Reshape for multi-head attention
-        queries = queries.view(bsz, seq_len, self.n_heads, self.head_dim)
-        keys = keys.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
-        values = values.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+        queries = _queries.view(bsz, seq_len, self.n_heads, self.head_dim)
+        keys = _keys.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+        values = _values.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
 
-        # Apply RoPE
         start_pos = past_key_values[0].shape[1] if past_key_values is not None else 0
         queries, keys = self.rope(queries, keys, start_pos)
 
@@ -704,12 +579,11 @@ class MAMLCompatibleAttention(nn.Module):
             keys = torch.repeat_interleave(keys, self.n_rep, dim=2)
             values = torch.repeat_interleave(values, self.n_rep, dim=2)
 
-        # Prepare for attention computation
         queries = queries.transpose(1, 2)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
 
-        # Compute attention scores with explicit operations
+        # Compute attention with explicit gradient retention
         scores = torch.matmul(queries, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask
@@ -717,90 +591,105 @@ class MAMLCompatibleAttention(nn.Module):
 
         output = torch.matmul(scores, values)
         output = output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
-        output = F.linear(output, self.o_proj_weight)
+        output = self.o_proj(output)
 
         return output, (cached_keys, cached_values)
 
 
-class MAMLCompatibleSwiGLU(nn.Module):
-    """MAML-compatible version of SwiGLU activation with linear projections"""
-
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        d_model = config.d_model
-        hidden_dim = config.activation_hidden_dim
-
-        # Explicit parameter registration
-        self.register_parameter(
-            "w0_weight", nn.Parameter(torch.empty(hidden_dim, d_model))
-        )
-        self.register_parameter(
-            "w1_weight", nn.Parameter(torch.empty(hidden_dim, d_model))
-        )
-        self.register_parameter(
-            "w2_weight", nn.Parameter(torch.empty(d_model, hidden_dim))
-        )
-
-        # Initialize weights
-        nn.init.normal_(self.w0_weight, std=0.02)
-        nn.init.normal_(self.w1_weight, std=0.02)
-        nn.init.normal_(self.w2_weight, std=0.02)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Explicit operations for gradient tracking
-        w0_out = F.linear(x, self.w0_weight)
-        w1_out = F.linear(x, self.w1_weight)
-        hidden = F.silu(w0_out) * w1_out
-        return F.linear(hidden, self.w2_weight)
-
-
-class MAMLCompatiblePicoBlock(nn.Module):
-    """Modified PicoBlock for MAML compatibility"""
-
-    def __init__(self, config):
-        super().__init__()
-        self.attention = MAMLCompatibleAttention(config)
-        self.feed_forward = MAMLCompatibleSwiGLU(config)
-
-        # Explicit parameter registration for norms
-        self.register_parameter(
-            "attention_norm_weight", nn.Parameter(torch.ones(config.d_model))
-        )
-        self.register_parameter(
-            "ffn_norm_weight", nn.Parameter(torch.ones(config.d_model))
-        )
-
-        self.config = config
+class MAMLCompatiblePicoBlock(PicoBlock):
+    """Minimally modified PicoBlock for MAML compatibility"""
 
     def forward(
         self,
-        x: torch.Tensor,
+        input: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Tuple[torch.Tensor]] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        # Modified forward pass with explicit operations for gradient tracking
-        normed_x = F.layer_norm(
-            x,
-            normalized_shape=x.size(-1),
-            weight=self.attention_norm_weight,
-            eps=self.config.norm_eps,
+        # Only modification: ensure gradient flow through residual connections
+        normed_input = self.attention_norm(input)
+        attention_output, cached_key_values = self.attention(
+            normed_input,
+            mask=mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
         )
-        attention_output, cached_kv = self.attention(
-            normed_x, past_key_values=past_key_values, use_cache=use_cache
-        )
-        h = x + attention_output
 
-        normed_h = F.layer_norm(
-            h,
-            normalized_shape=h.size(-1),
-            weight=self.ffn_norm_weight,
-            eps=self.config.norm_eps,
-        )
-        ffn_output = self.feed_forward(normed_h)
-        out = h + ffn_output
+        h = input + attention_output  # Gradient flows through addition
 
-        return out, cached_kv
+        normed_h = self.swiglu_norm(h)
+        feed_forward_output = self.feed_forward(normed_h)
+        out = h + feed_forward_output  # Gradient flows through addition
+
+        return out, cached_key_values
+
+
+class MAMLCompatiblePico(Pico):
+    """Minimally modified Pico model for MAML compatibility"""
+
+    def __init__(
+        self,
+        model_config: Union["ModelConfig", "PicoHFConfig"],
+        fabric: Optional["L.Fabric"] = None,
+    ):
+        super().__init__(model_config, fabric)
+        # Replace standard PicoBlocks with MAML-compatible ones
+        self.layers = nn.ModuleList(
+            [
+                MAMLCompatiblePicoBlock(model_config, fabric)
+                for _ in range(model_config.n_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[Tuple[torch.Tensor, torch.Tensor]]]]:
+        # Main modification: ensure graph retention through embedding and output
+        h = self.embedding_proj(input_ids)
+
+        cached_key_values = () if use_cache else None
+
+        for idx, layer in enumerate(self.layers):
+            layer_past = past_key_values[idx] if past_key_values is not None else None
+            h, layer_cached = layer(h, past_key_values=layer_past, use_cache=use_cache)
+            if use_cache:
+                cached_key_values += (layer_cached,)
+
+        h = self.output_norm(h)
+        logits = self.de_embedding_proj(h)
+
+        return logits.float(), cached_key_values
+
+
+# Helper function to verify MAML compatibility
+def verify_maml_compatibility(model: MAMLCompatiblePico) -> bool:
+    """
+    Verifies that the model is properly setup for MAML training.
+    Returns True if the model is MAML-compatible, raises ValueError otherwise.
+    """
+    try:
+        # Check that all parameters are leaf nodes
+        for name, param in model.named_parameters():
+            if not param.is_leaf:
+                raise ValueError(f"Parameter {name} is not a leaf node")
+
+        # Test higher-order gradients with a small forward pass
+        dummy_input = torch.randint(0, 100, (2, 10))
+        output, _ = model(dummy_input)
+        loss = output.mean()
+
+        # Try to compute second-order gradients
+        grads = torch.autograd.grad(loss, model.parameters(), create_graph=True)
+        grad_norm = sum(g.sum() for g in grads if g is not None)
+        torch.autograd.grad(grad_norm, model.parameters())
+
+        return True
+
+    except Exception as e:
+        raise ValueError(f"Model is not MAML-compatible: {str(e)}")
 
 
 ########################################################

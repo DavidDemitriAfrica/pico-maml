@@ -657,7 +657,7 @@ class Trainer:
         self.logger.log(level, msg)
 
 
-class MAMLTrainer:
+class MAMLTrainer(Trainer):
     def __init__(self, config_path: str):
         """
         Initializes the MAML Trainer with meta-learning specific configurations.
@@ -666,11 +666,13 @@ class MAMLTrainer:
         # Keep original initialization but add MAML-specific configs
         super().__init__(config_path)
 
-        # MAML specific configurations
-        self.inner_lr = self.configs["training"].get("inner_learning_rate", 0.01)
-        self.num_inner_steps = self.configs["training"].get("num_inner_steps", 5)
-        self.meta_batch_size = self.configs["training"].get("meta_batch_size", 4)
-        self.num_tasks = self.configs["training"].get("num_tasks", 100)
+        # MAML specific configurations - access directly from training config
+        training_config = self.configs["training"]
+        # Use getattr with default values for optional parameters
+        self.inner_lr = getattr(training_config, "inner_learning_rate", 0.01)
+        self.num_inner_steps = getattr(training_config, "num_inner_steps", 5)
+        self.meta_batch_size = getattr(training_config, "meta_batch_size", 4)
+        self.num_tasks = getattr(training_config, "num_tasks", 100)
 
         # Verify the model supports computational graph requirements
         self._verify_model_compatibility()
