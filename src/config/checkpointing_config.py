@@ -71,7 +71,7 @@ class CheckpointingConfig:
 
     # Should be in the format of <(username or )>/<repo_name>, e.g. pico-lm/pico-7b
     save_checkpoint_repo_id: Optional[str] = "davidafrica/pico-maml"
-    hf_collection_slug: Optional[str] = None
+    hf_collection_slug: Optional[str] = "davidafrica/pico-maml"
 
     training: TrainingCheckpointingConfig = field(
         default_factory=TrainingCheckpointingConfig
