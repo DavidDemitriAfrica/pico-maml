@@ -500,15 +500,10 @@ class Trainer:
             self.model.classifier_smlmt.parameters(), lr=inner_lr
         )
 
-        # Save initial classifier parameters for later comparison
-        initial_classifier_params = [
-            p.clone() for p in self.model.classifier_smlmt.parameters()
-        ]
-
         with higher.innerloop_ctx(
             self.model.classifier_smlmt, classifier_optimizer, track_higher_grads=True
         ) as (fclassifier, diffopt):
-
+            # Define a helper function for the support forward pass.
             def support_forward(input_ids, attention_mask):
                 return self.model(
                     input_ids,
@@ -518,20 +513,16 @@ class Trainer:
 
             inner_losses = []
             inner_accuracies = []
-
-            # --- Inner Loop Timing Start ---
-            import time
-
-            inner_loop_start = time.time()
-
             # --- Inner loop: update classifier parameters on the support set ---
             for inner_step in range(inner_steps):
+                # Use activation checkpointing to reduce memory usage.
                 support_out = torch.utils.checkpoint.checkpoint(
                     support_forward,
                     support_inputs["input_ids"],
                     support_inputs["attention_mask"],
                     use_reentrant=False,
                 )
+                # Unpack output: assuming the model returns (output, hidden, extra)
                 _, support_hidden, _ = support_out
                 support_repr = support_hidden.mean(dim=1).bfloat16()
                 support_preds = fclassifier(support_repr)
@@ -552,35 +543,14 @@ class Trainer:
                 )
                 inner_losses.append(support_loss.item())
                 inner_accuracies.append(support_accuracy.item())
+                # Update the classifier parameters in the inner loop.
                 diffopt.step(support_loss)
-
-            # --- Inner Loop Timing End ---
-            inner_loop_time = time.time() - inner_loop_start
-            self.fabric.log(
-                "train/maml_inner_loop_time", inner_loop_time, step=batch_step
-            )
-
             avg_inner_accuracy = sum(inner_accuracies) / len(inner_accuracies)
-            # Compute standard deviation of inner losses
-            std_inner_loss = torch.std(torch.tensor(inner_losses)).item()
             self.fabric.log(
                 "train/maml_inner_accuracy_avg", avg_inner_accuracy, step=batch_step
             )
-            self.fabric.log(
-                "train/maml_inner_loss_std", std_inner_loss, step=batch_step
-            )
 
-            # Compute the average norm of the parameter update in the inner loop.
-            adapted_params = list(fclassifier.parameters())
-            update_norms = []
-            for orig, adapted in zip(initial_classifier_params, adapted_params):
-                update_norm = torch.norm(adapted - orig).item()
-                update_norms.append(update_norm)
-            avg_update_norm = sum(update_norms) / len(update_norms)
-            self.fabric.log(
-                "train/maml_param_update_norm", avg_update_norm, step=batch_step
-            )
-
+            # --- Query pass: compute meta loss using the updated classifier ---
             def query_forward(input_ids, attention_mask):
                 return self.model(
                     input_ids,
@@ -588,7 +558,6 @@ class Trainer:
                     return_hidden=True,
                 )
 
-            # --- Query pass: compute meta loss using the updated classifier ---
             query_out = torch.utils.checkpoint.checkpoint(
                 query_forward,
                 query_inputs["input_ids"],
@@ -599,20 +568,6 @@ class Trainer:
             query_repr = query_hidden.mean(dim=1).bfloat16()
             query_preds = fclassifier(query_repr)
             meta_loss = F.cross_entropy(query_preds, local_query_labels)
-
-            # Compute query accuracy
-            query_accuracy = (
-                (query_preds.argmax(dim=1) == local_query_labels).float().mean().item()
-            )
-            self.fabric.log(
-                "train/maml_query_accuracy", query_accuracy, step=batch_step
-            )
-
-            # Compute adaptation gap: difference between query accuracy and average inner (support) accuracy.
-            adaptation_gap = query_accuracy - avg_inner_accuracy
-            self.fabric.log(
-                "train/maml_adaptation_gap", adaptation_gap, step=batch_step
-            )
 
         # Aggregate the meta loss across GPUs.
         meta_loss_agg = self.fabric.all_reduce(meta_loss, reduce_op="mean")
