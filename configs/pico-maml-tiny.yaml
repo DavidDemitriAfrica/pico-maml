@@ -4,7 +4,7 @@
 
 checkpointing:
   run_name: "pico-maml-tiny-1"
-  save_checkpoint_repo_id: "david-africa/pico-tiny"
+  save_checkpoint_repo_id: "david-africa/pico-maml"
 
   learning_dynamics:
     batch_size: 256
