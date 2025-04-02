@@ -28,7 +28,7 @@ evaluation:
 smlmt:
   enabled: true
   probability: 0.5        # probability that the meta–learning component is computed on any given iteration
-  num_classes: 5           # K: number of target words per task e.g [2, 5, 10]
+  num_classes: 3           # K: number of target words per task e.g [2, 5, 10]
   support_per_class: 10    # S: number of support sentences per class e.g [5, 10, 20]
   query_per_class: 5       # Q: number of query sentences per class
   smlmt_weight: 1  # weight to scale the meta–learning loss relative to the supervised loss
