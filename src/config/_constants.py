@@ -4,7 +4,7 @@ Constants used throughout the codebase
 
 # Basic Training Constants used throughout the codebase
 VOCAB_SIZE = 50304
-MAX_SEQ_LEN = 4096
+MAX_SEQ_LEN = 2048
 BATCH_SIZE = 1024
 GRADIENT_ACCUMULATION_STEPS = 128
 
